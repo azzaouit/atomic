@@ -1,11 +1,12 @@
 #define _GNU_SOURCE
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "net_map.h"
 #include "node.h"
 
-#define NUM_LOCKS 1000
+#define NUM_LOCKS (1000)
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {

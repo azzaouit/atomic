@@ -5,10 +5,7 @@
 
 #define MAX_SLOTS (1000000)
 #define FRONTIER_NODE (0)
-#define MAX_CONCURRENT_REQ (64)
-#define TRACK_SLOTS (1)
-
-// #define DEBUG (0)
+// #define DEBUG (1)
 
 #ifdef DEBUG
 #include <stdio.h>

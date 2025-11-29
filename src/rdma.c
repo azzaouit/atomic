@@ -99,8 +99,8 @@ int rdma_init(struct rdma_ctx *r, struct config *c) {
         goto errslots;
     }
 
-    // allocate per-thread results buffer
-    nb = sizeof(uint64_t) * (c->n + 1) * MAX_CONCURRENT_REQ;
+    // allocate results buffer
+    nb = sizeof(uint64_t) * (c->n + 1);
     if (!(r->results = calloc(1, nb))) {
         perror("calloc:");
         goto errmr;
