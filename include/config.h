@@ -5,7 +5,7 @@
 
 #define MAX_SLOTS (1000000)
 #define FRONTIER_NODE (0)
-// #define DEBUG (1)
+#define DEBUG (1)
 
 #ifdef DEBUG
 #include <stdio.h>

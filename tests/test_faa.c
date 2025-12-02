@@ -38,10 +38,6 @@ int main(int argc, char *argv[]) {
         if (ret >= 0) fprintf(stderr, "%hu,%ld,%lu\n", host_id, ret, elapsed);
     }
 
-#ifdef TRACK_SLOTS
-    DUMP_CSV(stdout, &n);
-#endif
-
     node_destroy(&n);
     return 0;
 }
