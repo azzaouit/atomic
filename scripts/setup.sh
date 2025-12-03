@@ -12,7 +12,7 @@ LEADER=${lines[0]}
 UPDATE_CMD="sudo apt update -y && sudo apt upgrade -y"
 DEPS_CMD="sudo apt install -y build-essential make rdma-core libibverbs-dev librdmacm-dev ibverbs-utils"
 REBOOT_CMD="sudo reboot"
-SRC_DIR=$(realpath ../atomic)
+SRC_DIR=$(realpath ../)
 
 # Run a remote command over SSH
 run_cmd() {
@@ -54,7 +54,7 @@ setup() {
 build() {
     local M=$1
     run_cmd $M "rm -rf ~/atomic"
-    rsync -avz $(realpath ../atomic) $M:~
+    rsync -avz $SRC_DIR $M:~
     run_cmd $M "make -C ~/atomic clean all"
 }
 

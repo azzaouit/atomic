@@ -6,10 +6,14 @@
 #define FAST_QUORUM(c) ((c->n * 3 + 3) / 4)
 #define CLASSIC_QUORUM(c) (((c)->n / 2) + 1)
 
+static int __thread_count = 0;
+static __thread int __tid = -1;
+
 /* Broadcast atomic RDMA CAS */
 int rdma_bcas(struct rdma_ctx *r, uint32_t slot, uint64_t swp) {
     struct config *c = r->c;
-    uint64_t *thread_results = r->results;
+    off_t offset = c->n * __tid;
+    uint64_t *thread_results = r->results + (c->n + 1) * __tid;
 
     uint64_t local_result =
         __sync_val_compare_and_swap(&r->shared_mem->slots[slot], 0, swp);
@@ -19,7 +23,7 @@ int rdma_bcas(struct rdma_ctx *r, uint32_t slot, uint64_t swp) {
     for (int i = 0; i < c->n; ++i) {
         if (i != c->host_id) {
             struct ibv_send_wr *bad_wr = NULL, wr = {};
-            struct remote_attr *a = r->ra + i;
+            struct remote_attr *a = r->ra + offset + i;
             uint64_t remote_slot_addr =
                 a->addr + offsetof(typeof(*r->shared_mem), slots) +
                 (slot * sizeof(uint64_t));
@@ -38,19 +42,24 @@ int rdma_bcas(struct rdma_ctx *r, uint32_t slot, uint64_t swp) {
             wr.wr.atomic.rkey = a->rkey;
             wr.wr.atomic.compare_add = 0;
             wr.wr.atomic.swap = swp;
-
-            ibv_post_send(r->qp[i], &wr, &bad_wr);
+            if (ibv_post_send(r->qp[offset + i], &wr, &bad_wr)) {
+                FAA_LOG("ibv_post_send failed for node %d, errno=%d", i, errno);
+                perror("ibv_post_send");
+            }
         }
     }
 
-    struct ibv_wc wc[c->n * 2];
+    struct ibv_wc wc[c->n];
     int left = c->n - 1, n = 0;
     while (1)
-        if ((n = ibv_poll_cq(r->cq, left, wc)) > 0)
+        if ((n = ibv_poll_cq(r->cq[__tid], left, wc)) > 0)
             for (int i = 0; i < n; ++i) {
                 uint32_t completion_slot = (uint32_t)(wc[i].wr_id >> 16);
                 int node_id = wc[i].wr_id & 0xFFFF;
-                if (completion_slot == slot && wc[i].status == IBV_WC_SUCCESS) {
+                if (wc[i].status != IBV_WC_SUCCESS) {
+                    FAA_LOG("[%hu:%d] Work completion error: %s", r->c->host_id,
+                            __tid, ibv_wc_status_str(wc[i].status));
+                } else if (completion_slot == slot) {
                     successes += (thread_results[node_id] == 0);
                     if (successes >= FAST_QUORUM(c)) return !local_won;
                     --left;
@@ -64,8 +73,9 @@ int rdma_bcas(struct rdma_ctx *r, uint32_t slot, uint64_t swp) {
 int rdma_slow_path(struct rdma_ctx *r, uint32_t slot, uint64_t ballot,
                    uint64_t proposed_value) {
     struct config *c = r->c;
-    uint64_t *thread_results = r->results;
-    struct prep_res *results = r->prepares;
+    off_t offset = c->n * __tid;
+    uint64_t *thread_results = r->results + (c->n + 1) * __tid;
+    struct prep_res *results = r->prepares + offset;
     memset(results, 0, sizeof(struct prep_res) * c->n);
 
     // Phase 2a (Prepare): Read current values
@@ -74,7 +84,7 @@ int rdma_slow_path(struct rdma_ctx *r, uint32_t slot, uint64_t ballot,
     results[c->host_id].success = 1;
     for (int i = 0; i < c->n; ++i)
         if (i != c->host_id) {
-            struct remote_attr *ra = r->ra + i;
+            struct remote_attr *ra = r->ra + offset + i;
             uint64_t remote_slot_addr =
                 ra->addr + offsetof(typeof(*r->shared_mem), slots) +
                 (slot * sizeof(uint64_t));
@@ -89,22 +99,28 @@ int rdma_slow_path(struct rdma_ctx *r, uint32_t slot, uint64_t ballot,
                 .send_flags = IBV_SEND_SIGNALED,
                 .wr.rdma = {.remote_addr = remote_slot_addr, .rkey = ra->rkey}};
             struct ibv_send_wr *bad_wr;
-            ibv_post_send(r->qp[i], &wr, &bad_wr);
+            if (ibv_post_send(r->qp[offset + i], &wr, &bad_wr)) {
+                FAA_LOG("ibv_post_send failed for node %d, errno=%d", i, errno);
+                perror("ibv_post_send");
+            }
         }
 
     struct ibv_wc wc[c->n];
     int completed = 0;
     int num_posted = c->n - 1;
     while (completed < num_posted) {
-        int n = ibv_poll_cq(r->cq, num_posted - completed, wc);
+        int n = ibv_poll_cq(r->cq[__tid], num_posted - completed, wc);
         if (n > 0) {
             for (int i = 0; i < n; ++i) {
                 int remote_idx = wc[i].wr_id;
-                if (wc[i].status == IBV_WC_SUCCESS) {
+                if (wc[i].status != IBV_WC_SUCCESS) {
+                    FAA_LOG("[%hu:%d] Work completion error: %s", r->c->host_id,
+                            __tid, ibv_wc_status_str(wc[i].status));
+                    results[remote_idx].success = 0;
+                } else {
                     results[remote_idx].ballot = thread_results[remote_idx];
                     results[remote_idx].success = 1;
-                } else
-                    results[remote_idx].success = 0;
+                }
             }
             completed += n;
         }
@@ -156,7 +172,7 @@ int rdma_slow_path(struct rdma_ctx *r, uint32_t slot, uint64_t ballot,
     int accepts = (res == cmp);
     for (int i = 0; i < c->n; ++i)
         if (i != c->host_id) {
-            struct remote_attr *ra = r->ra + i;
+            struct remote_attr *ra = r->ra + offset + i;
             uint64_t remote_slot_addr =
                 ra->addr + offsetof(typeof(*r->shared_mem), slots) +
                 (slot * sizeof(uint64_t));
@@ -175,16 +191,22 @@ int rdma_slow_path(struct rdma_ctx *r, uint32_t slot, uint64_t ballot,
                               .compare_add = expected,
                               .swap = proposal}};
             struct ibv_send_wr *bad_wr;
-            ibv_post_send(r->qp[i], &wr, &bad_wr);
+            if (ibv_post_send(r->qp[offset + i], &wr, &bad_wr)) {
+                FAA_LOG("ibv_post_send failed for node %d, errno=%d", i, errno);
+                perror("ibv_post_send");
+            }
         }
 
     completed = 0;
     num_posted = c->n - 1;
     while (completed < num_posted) {
-        int n = ibv_poll_cq(r->cq, num_posted - completed, wc);
+        int n = ibv_poll_cq(r->cq[__tid], num_posted - completed, wc);
         if (n > 0) {
             for (int i = 0; i < n; ++i)
-                if (wc[i].status == IBV_WC_SUCCESS) {
+                if (wc[i].status != IBV_WC_SUCCESS)
+                    FAA_LOG("[%hu:%d] Work completion error: %s", r->c->host_id,
+                            __tid, ibv_wc_status_str(wc[i].status));
+                else {
                     int remote_idx = wc[i].wr_id;
                     uint64_t returned = thread_results[remote_idx];
                     uint64_t expected = results[remote_idx].ballot;
@@ -200,8 +222,15 @@ int rdma_slow_path(struct rdma_ctx *r, uint32_t slot, uint64_t ballot,
 
 /* Read next slot from frontier node */
 uint64_t rdma_get_next_slot(struct rdma_ctx *r) {
-    uint64_t *result_ptr = r->results + r->c->n;
-    struct remote_attr *ra = r->ra + FRONTIER_NODE;
+    if (__tid == -1) __tid = __sync_fetch_and_add(&__thread_count, 1);
+    if (__tid < 0 || __tid >= MAX_THREADS) {
+        FAA_LOG("MAX_THREADS exceeded");
+        return -1;
+    }
+
+    uint64_t *result_ptr = r->results + (r->c->n + 1) * __tid + r->c->n;
+    off_t offset = r->c->n * __tid + FRONTIER_NODE;
+    struct remote_attr *ra = r->ra + offset;
     uint64_t remote_frontier_addr =
         ra->addr + offsetof(typeof(*r->shared_mem), frontier);
 
@@ -219,15 +248,22 @@ uint64_t rdma_get_next_slot(struct rdma_ctx *r) {
                                            .compare_add = 1}};
 
     struct ibv_send_wr *bad_wr;
-    if (ibv_post_send(r->fqp[FRONTIER_NODE], &wr, &bad_wr)) {
-        FAA_LOG("Failed to post frontier FAA");
+    if (ibv_post_send(r->fqp[offset], &wr, &bad_wr)) {
+        FAA_LOG("ibv_post_send failed for node errno=%d", errno);
+        perror("ibv_post_send");
         return -1;
     }
 
     struct ibv_wc wc;
     while (1)
-        if (ibv_poll_cq(r->fcq, 1, &wc) > 0)
-            return wc.status == IBV_WC_SUCCESS ? *result_ptr : (uint64_t)-1;
+        if (ibv_poll_cq(r->fcq[__tid], 1, &wc) > 0) {
+            if (wc.status != IBV_WC_SUCCESS) {
+                FAA_LOG("[%hu:%d] Work completion error: %s", r->c->host_id,
+                        __tid, ibv_wc_status_str(wc.status));
+                return (uint64_t)-1;
+            }
+            return *result_ptr;
+        }
 
     return -1;
 }

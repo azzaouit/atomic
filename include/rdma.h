@@ -30,8 +30,8 @@ struct rdma_ctx {
   uint8_t gid[16];
   struct ibv_pd *pd;
   struct ibv_mr *mr[2];
-  struct ibv_cq *cq;   // CQ for consensus operations
-  struct ibv_cq *fcq;  // CQ for frontier operations
+  struct ibv_cq **cq;  // MAX_THREADS CQ for consensus operations
+  struct ibv_cq **fcq; // CQ for frontier operations
   struct ibv_qp **qp;  // QPs for consensus operations
   struct ibv_qp **fqp; // QPs for frontier FAA
   struct {             // Shared (RDMA accessible)

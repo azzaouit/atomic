@@ -8,7 +8,6 @@ struct node_ctx {
   uint16_t id;
   uint32_t seed;
   struct rdma_ctx r;
-  pthread_mutex_t lock;
 };
 
 /* Initialize node context */

@@ -19,29 +19,30 @@ int64_t fetch_and_add(struct node_ctx *ctx) {
     struct rdma_ctx *r = &ctx->r;
     uint64_t slot = 0;
     int64_t ret = 0;
-    pthread_mutex_lock(&ctx->lock);
+
     while (1) {
         /* Get assigned slot */
         slot = rdma_get_next_slot(r);
         if (slot == (uint64_t)-1) {  // failed. try again
+            FAA_LOG("Get next slot failed");
             usleep(100);
             continue;
         } else if (slot >= MAX_SLOTS) {
-            slot = -ENOMEM;
-            goto done;
+            FAA_LOG("Out of slots");
+            return -ENOMEM;
         }
 
         /* 1. Try fast path */
         ret = __try_fast_path(ctx, slot);
         if (!ret)
-            goto done;  // this thread won
+            return slot;  // this thread won
         else if (ret == 1)
             continue;  // slot commited by another thread
 
         /* 2. Fast path failed. Try slow path */
         ret = __try_slow_path(ctx, slot);
         if (!ret)
-            goto done;  // this thread won
+            return slot;  // this thread won
         else if (ret == 1)
             continue;  // slot commited by another thread
 
@@ -53,9 +54,6 @@ int64_t fetch_and_add(struct node_ctx *ctx) {
             usleep(1);
         }
     }
-done:
-    pthread_mutex_unlock(&ctx->lock);
-    return slot;
 }
 
 int64_t test_and_set(struct node_ctx *ctx, uint32_t slot) {
@@ -90,11 +88,7 @@ int64_t test_and_set(struct node_ctx *ctx, uint32_t slot) {
 int node_init(struct node_ctx *ctx, struct config *c) {
     ctx->id = c->host_id;
     ctx->seed = (uint32_t)time(0) ^ (uint32_t)ctx->id;
-    pthread_mutex_init(&ctx->lock, 0);
     return rdma_init(&ctx->r, c);
 }
 
-void node_destroy(struct node_ctx *ctx) {
-    pthread_mutex_destroy(&ctx->lock);
-    rdma_destroy(&ctx->r);
-}
+void node_destroy(struct node_ctx *ctx) { rdma_destroy(&ctx->r); }

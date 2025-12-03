@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define MAX_SLOTS (1000000)
+#define MAX_THREADS (1000)
 #define FRONTIER_NODE (0)
 #define DEBUG (1)
 

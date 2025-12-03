@@ -3,8 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "net_map.h"
 #include "node.h"
+#include "roce_map.h"
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {

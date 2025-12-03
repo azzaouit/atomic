@@ -17,7 +17,6 @@ struct thread_args {
 
 void *worker_thread(void *arg) {
     struct thread_args *args = (struct thread_args *)arg;
-
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(args->host_id * 16 + args->thread_id, &cpuset);
@@ -33,6 +32,8 @@ void *worker_thread(void *arg) {
         else if (ret == -ENOMEM)
             break;
     }
+
+    FAA_LOG("[%d] Worker thread %d exiting", args->ctx->id, args->thread_id);
 
     return NULL;
 }
@@ -71,15 +72,16 @@ int main(int argc, char *argv[]) {
             args[i].host_id = host_id;
             pthread_create(threads + i, NULL, worker_thread, args + i);
         }
-
         for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
-
         free(threads);
         free(args);
     }
 
-    // Wait for other nodes to finish
-    sleep(10);
+    // Wait for last slot to fill
+    while (!((volatile uint64_t *)n.r.shared_mem->slots)[MAX_SLOTS - 1])
+        sleep(1);
+
+    FAA_LOG("Node %d exiting", n.id);
 
     node_destroy(&n);
     return 0;

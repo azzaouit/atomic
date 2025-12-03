@@ -66,8 +66,9 @@ void __get_local_attr(struct rdma_ctx *r, struct remote_attr *p, int id,
 
 // Connect local QP using remote QP info
 int __qp_connect(struct rdma_ctx *r, struct node_config *c,
-                 struct remote_attr *ra, int frontier) {
+                 struct remote_attr *ra, int tid, int frontier) {
     int ret = 0;
+    off_t offset = r->c->n * tid + c->id;
     uint16_t ib_port = c->ib_port;
     uint16_t gid_index = c->gid_index;
     struct ibv_qp_attr rtr_attr = {
@@ -90,7 +91,7 @@ int __qp_connect(struct rdma_ctx *r, struct node_config *c,
     for (int i = 0; i < 16; ++i) rtr_attr.ah_attr.grh.dgid.raw[i] = ra->gid[i];
 
     // set QP to RTR state
-    ret = ibv_modify_qp(frontier ? r->fqp[c->id] : r->qp[c->id], &rtr_attr,
+    ret = ibv_modify_qp(frontier ? r->fqp[offset] : r->qp[offset], &rtr_attr,
                         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
                             IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
                             IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
@@ -109,7 +110,7 @@ int __qp_connect(struct rdma_ctx *r, struct node_config *c,
     rts_attr.max_rd_atomic = MAX_RD_ATOMIC;
 
     // set QP to RTS state
-    ret = ibv_modify_qp(frontier ? r->fqp[c->id] : r->qp[c->id], &rts_attr,
+    ret = ibv_modify_qp(frontier ? r->fqp[offset] : r->qp[offset], &rts_attr,
                         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
                             IBV_QP_MAX_QP_RD_ATOMIC);
@@ -175,64 +176,66 @@ void *__server_thread(void *ptr) {
             id = ntohs(id);
             FAA_LOG("Server received client ID = %d", id);
 
-            // get local attributes for this host
-            __get_local_attr(r, &local, id, 0);
+            for (int i = 0; i < MAX_THREADS; ++i) {
+                off_t offset = c->n * i + id;
 
-            // write local attributes to remote peer
-            RA_TO_NET(&local);
-            if ((nbytes = write(clientfd, &local, RX_LEN)) != RX_LEN) {
-                perror("write");
-                close(clientfd);
-                *ret = errno;
-                goto err;
-            }
+                /* Consensus QP Exchange */
 
-            // read remote attributes from remote peer
-            if ((nbytes = read(clientfd, r->ra + id, RX_LEN)) != RX_LEN) {
-                perror("read");
-                close(clientfd);
-                *ret = errno;
-                goto err;
-            }
-            RA_FROM_NET(r->ra + id);
+                // get local attributes for this host
+                __get_local_attr(r, &local, offset, 0);
+                // write local attributes to remote peer
+                RA_TO_NET(&local);
+                if ((nbytes = write(clientfd, &local, RX_LEN)) != RX_LEN) {
+                    perror("write");
+                    close(clientfd);
+                    *ret = errno;
+                    goto err;
+                }
+                // read remote attributes from remote peer
+                if ((nbytes = read(clientfd, r->ra + offset, RX_LEN)) !=
+                    RX_LEN) {
+                    perror("read");
+                    close(clientfd);
+                    *ret = errno;
+                    goto err;
+                }
+                RA_FROM_NET(r->ra + offset);
+                if (__qp_connect(r, c->c + id, r->ra + offset, i, 0)) {
+                    FAA_LOG("QP connection failed");
+                    close(clientfd);
+                    *ret = 2;
+                    goto err;
+                }
 
-            if (__qp_connect(r, c->c + id, r->ra + id, 0)) {
-                FAA_LOG("QP connection failed");
-                close(clientfd);
-                *ret = 2;
-                goto err;
-            }
+                /* Frontier QP Exchange */
 
-            // get frontier attributes for this host
-            __get_local_attr(r, &local, id, 1);
-            // write frontier attributes to remote peer
-            RA_TO_NET(&local);
-            if ((nbytes = write(clientfd, &local, RX_LEN)) != RX_LEN) {
-                perror("write");
-                close(clientfd);
-                *ret = errno;
-                goto err;
+                // get frontier attributes for this host
+                __get_local_attr(r, &local, offset, 1);
+                // write frontier attributes to remote peer
+                RA_TO_NET(&local);
+                if ((nbytes = write(clientfd, &local, RX_LEN)) != RX_LEN) {
+                    perror("write");
+                    close(clientfd);
+                    *ret = errno;
+                    goto err;
+                }
+                memset(&local, 0, sizeof(local));
+                // read frontier attributes from remote peer
+                if ((nbytes = read(clientfd, &local, RX_LEN)) != RX_LEN) {
+                    perror("read");
+                    close(clientfd);
+                    *ret = errno;
+                    goto err;
+                }
+                RA_FROM_NET(&local);
+                // connect frontier queue pairs
+                if (__qp_connect(r, c->c + id, &local, i, 1)) {
+                    FAA_LOG("QP connection failed");
+                    close(clientfd);
+                    *ret = 2;
+                    goto err;
+                }
             }
-            FAA_LOG("[%hu] Sent frontier attributes to node %hu\n", c->host_id,
-                    id);
-            memset(&local, 0, sizeof(local));
-            // read frontier attributes from remote peer
-            if ((nbytes = read(clientfd, &local, RX_LEN)) != RX_LEN) {
-                perror("read");
-                close(clientfd);
-                *ret = errno;
-                goto err;
-            }
-            RA_FROM_NET(&local);
-            // connect queue pairs
-            if (__qp_connect(r, c->c + id, &local, 1)) {
-                FAA_LOG("QP connection failed");
-                close(clientfd);
-                *ret = 2;
-                goto err;
-            }
-            FAA_LOG("[%hu] Connected frontier QP to node %hu\n", c->host_id,
-                    id);
 
             FAA_LOG("RDMA exchange with node %d success", id);
             close(clientfd);
@@ -298,59 +301,60 @@ void *__client_thread(void *ptr) {
         goto exit;
     }
 
-    // local attributes for this host
-    __get_local_attr(r, &local, id, 0);
-    // write local attributes to peer
-    RA_TO_NET(&local);
-    if ((nbytes = write(sockfd, &local, RX_LEN)) != RX_LEN) {
-        perror("write");
-        *ret = errno;
-        goto exit;
-    }
-    // read remote attributes from peer
-    if ((nbytes = read(sockfd, r->ra + id, RX_LEN)) != RX_LEN) {
-        perror("read");
-        *ret = errno;
-        goto exit;
-    }
-    RA_FROM_NET(r->ra + id);
-    // connect queue pairs
-    if (__qp_connect(r, c->c + id, r->ra + id, 0)) {
-        FAA_LOG("QP connection failed");
-        *ret = 2;
-        goto exit;
-    }
+    for (int i = 0; i < MAX_THREADS; ++i) {
+        off_t offset = r->c->n * i + id;
 
-    // local attributes for this host
-    __get_local_attr(r, &local, id, 1);
+        /* Consensus QP Exchange */
 
-    // write local attributes to peer
-    RA_TO_NET(&local);
-    if ((nbytes = write(sockfd, &local, RX_LEN)) != RX_LEN) {
-        perror("write");
-        *ret = errno;
-        goto exit;
+        // local attributes for this host
+        __get_local_attr(r, &local, offset, 0);
+        // write local attributes to peer
+        RA_TO_NET(&local);
+        if ((nbytes = write(sockfd, &local, RX_LEN)) != RX_LEN) {
+            perror("write");
+            *ret = errno;
+            goto exit;
+        }
+        // read remote attributes from peer
+        if ((nbytes = read(sockfd, r->ra + offset, RX_LEN)) != RX_LEN) {
+            perror("read");
+            *ret = errno;
+            goto exit;
+        }
+        RA_FROM_NET(r->ra + offset);
+        // connect queue pairs
+        if (__qp_connect(r, c->c + id, r->ra + offset, i, 0)) {
+            FAA_LOG("QP connection failed");
+            *ret = 2;
+            goto exit;
+        }
+
+        /* Frontier QP Exchange */
+
+        // local attributes for this host
+        __get_local_attr(r, &local, offset, 1);
+        // write local attributes to peer
+        RA_TO_NET(&local);
+        if ((nbytes = write(sockfd, &local, RX_LEN)) != RX_LEN) {
+            perror("write");
+            *ret = errno;
+            goto exit;
+        }
+        memset(&local, 0, sizeof(local));
+        // read remote attributes from peer
+        if ((nbytes = read(sockfd, &local, RX_LEN)) != RX_LEN) {
+            perror("read");
+            *ret = errno;
+            goto exit;
+        }
+        RA_FROM_NET(&local);
+        // connect queue pairs
+        if (__qp_connect(r, c->c + id, &local, i, 1)) {
+            FAA_LOG("QP connection failed");
+            *ret = 2;
+            goto exit;
+        }
     }
-
-    memset(&local, 0, sizeof(local));
-
-    // read remote attributes from peer
-    if ((nbytes = read(sockfd, &local, RX_LEN)) != RX_LEN) {
-        perror("read");
-        *ret = errno;
-        goto exit;
-    }
-    RA_FROM_NET(&local);
-    FAA_LOG("[%hu] Received frontier RA from node %d", c->host_id, id);
-
-    // connect queue pairs
-    if (__qp_connect(r, c->c + id, &local, 1)) {
-        FAA_LOG("QP connection failed");
-        *ret = 2;
-        goto exit;
-    }
-
-    FAA_LOG("[%hu] connected frontier QP to node %d", c->host_id, id);
 
     FAA_LOG("RDMA exchange with node %d success", id);
 exit:
@@ -395,8 +399,12 @@ int rdma_handshake(struct rdma_ctx *r) {
 
     /* Setup loopback connection for frontier FAA */
     if (!sa.ret) {
-        __get_local_attr(r, r->ra + c->host_id, c->host_id, 1);
-        return __qp_connect(r, c->c + c->host_id, r->ra + c->host_id, 1);
+        for (int i = 0; i < MAX_THREADS; ++i) {
+            off_t offset = c->n * i + c->host_id;
+            __get_local_attr(r, r->ra + offset, offset, 1);
+            __qp_connect(r, c->c + c->host_id, r->ra + offset, i, 1);
+        }
+        return 0;
     }
 
     return sa.ret;
